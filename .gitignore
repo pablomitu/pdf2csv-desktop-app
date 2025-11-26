@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual environments ---
+venv/
+env/
+ENV/
+*.env
+
+# --- Build artifacts (PyInstaller) ---
+build/
+dist/
+*.spec
+
+# --- Output files ---
+*.csv
+*.xlsx
+*.xls
+*.txt
+*.log
+
+# --- OS trash ---
+Thumbs.db
+.DS_Store
+
+# --- IDE directories ---
+.vscode/
+.idea/
+
+# --- TkinterDnD2 cache ---
+tkdnd2.8/
+
+# --- Don't upload actual PDFs accidentally ---
+*.pdf
+
+# --- App specific ---
+src/output/
