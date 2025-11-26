@@ -58,9 +58,10 @@ cd pdf2csv-desktop-app
 ---
 
 ### 2. Create a virtual environment
-`python -m venv venv`
-`venv\Scripts\activate`
-
+```bash
+python -m venv venv`
+venv\Scripts\activate`
+```
 ---
 
 ### 3. Install Dependencies
