@@ -51,22 +51,22 @@ pdf2csv-desktop-app/
 ## 🛠 Installation (Developer)
 
 ### 1. Clone the repository
-bash
+```bash
 git clone <your-private-repo-url>
 cd pdf2csv-desktop-app
-
+```
 ---
 
 ### 2. Create a virtual environment
-python -m venv venv
-venv\Scripts\activate
+`python -m venv venv`
+`venv\Scripts\activate`
 
 ---
 
 ### 3. Install Dependencies
-pip install -r requirements.txt
+`pip install -r requirements.txt`
 
 ---
 
 ### 4. Run the application
-``` python src/pdf2csv_desktop.py
+`python src/pdf2csv_desktop.py`
