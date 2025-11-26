@@ -32,6 +32,7 @@ Built with:
 ---
 
 ## 📂 Project Structure
+```
 pdf2csv-desktop-app/
 │
 ├── src/
@@ -44,7 +45,7 @@ pdf2csv-desktop-app/
 ├── requirements.txt
 ├── README.md
 └── .gitignore
-
+```
 
 ---
 
@@ -59,8 +60,8 @@ cd pdf2csv-desktop-app
 
 ### 2. Create a virtual environment
 ```bash
-python -m venv venv`
-venv\Scripts\activate`
+python -m venv venv
+venv\Scripts\activate
 ```
 ---
 
