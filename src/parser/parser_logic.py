@@ -1,19 +1,16 @@
 """
 PDF parsing and CSV/Excel export utilities for the PDF-to-CSV converter app.
 
-This module extracts banking transaction tables from PDF statements,
-cleans monetary values, restructures transaction descriptions, and
-saves the combined output to CSV or Excel format.
+Includes live logging via an optional `log_callback`.
 """
 
 import os
 import re
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Callable
 
 import pandas as pd
 import pdfplumber
-
 
 # -------------------------------------------------------------------------
 # Constants & Patterns
@@ -34,8 +31,9 @@ def find_monetary_values(text: str) -> List[str]:
 
 def format_date(date_str: str) -> str:
     """
-    Convert a date to DD/MM/YYYY if it matches known formats.
-    Otherwise return the original string.
+    Convert a date string to DD/MM/YYYY if it matches known formats.
+
+    Otherwise, return the original string.
     """
     date_formats = ("%d/%m/%y", "%d-%m-%Y")
 
@@ -51,17 +49,27 @@ def format_date(date_str: str) -> str:
 # Core PDF Parsing Logic
 # -------------------------------------------------------------------------
 
-def process_pdf(pdf_path: str) -> pd.DataFrame:
+def process_pdf(
+    pdf_path: str,
+    progress_callback: Callable[[int, int], None] = None
+) -> pd.DataFrame:
     """
     Extract transaction data from a single PDF file.
 
-    Returns a DataFrame with columns:
-    Date, Transaction Details, Debit, Credit, Balance, Line Count, Page Number
+    Args:
+        pdf_path: Path to the PDF file.
+        progress_callback: Optional function(page_number, total_pages) to
+                           report progress per page.
+
+    Returns:
+        DataFrame containing the extracted transaction data.
     """
     records = []
     headers_found = False
 
     with pdfplumber.open(pdf_path) as pdf:
+        total_pages = len(pdf.pages)
+
         for page_number, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             lines = text.split("\n")
@@ -70,51 +78,51 @@ def process_pdf(pdf_path: str) -> pd.DataFrame:
             for line in lines:
                 line = line.strip()
 
-                # Skip metadata or boilerplate lines
                 if is_ignored_line(line):
                     continue
 
-                # Detect header row
                 if not headers_found and is_header_line(line):
                     headers_found = True
                     continue
 
-                # Handle continuation of long transaction descriptions
                 if is_date_on_own_line(line):
                     if records:
                         records[-1][1] += " " + line
                     continue
 
-                # Full transaction line containing date + details + numbers
-                if (match := re.match(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})(.*)$", line)):
-                    record = parse_transaction_line(
-                        match, line_count, page_number, records
-                    )
+                match = re.match(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})(.*)$", line)
+                if match:
+                    record = parse_transaction_line(match, line_count, page_number, records)
                     if record:
                         records.append(record)
                     continue
 
-                # Monetary detail lines that follow previous transaction
                 if is_monetary_line(line):
                     merge_monetary_line(records, line)
                     continue
 
-                # Otherwise, append to previous transaction description
                 if records:
                     records[-1][1] += " " + line
+
+            if progress_callback:
+                progress_callback(page_number, total_pages)
 
     return pd.DataFrame(
         records,
         columns=[
-            "Date", "Transaction Details",
-            "Debit", "Credit", "Balance",
-            "Line Count", "Page Number"
-        ]
+            "Date",
+            "Transaction Details",
+            "Debit",
+            "Credit",
+            "Balance",
+            "Line Count",
+            "Page Number",
+        ],
     )
 
 
 def is_ignored_line(line: str) -> bool:
-    """Return True if a line should be ignored."""
+    """Return True if a line should be ignored (metadata, boilerplate)."""
     return (
         "BANK OF PAPUA NEW GUINEA" in line
         or "Bank Statement for Account" in line
@@ -124,18 +132,18 @@ def is_ignored_line(line: str) -> bool:
 
 
 def is_header_line(line: str) -> bool:
-    """Check if a line represents a transaction header row."""
+    """Return True if a line represents a transaction header row."""
     keywords = ["DATE", "TRANSACTION DETAILS", "DEBIT", "CREDIT", "BALANCE"]
     return all(word in line for word in keywords)
 
 
 def is_date_on_own_line(line: str) -> bool:
-    """Determine if a line containing only a date should be merged."""
+    """Return True if the line contains only a date and should be merged."""
     return bool(re.match(r"^\d{1,2}\.\d{1,2}\.\d{2,4}$", line))
 
 
 def is_monetary_line(line: str) -> bool:
-    """Check if a line contains only monetary values."""
+    """Return True if the line contains only monetary values."""
     return bool(re.match(r"^[\d,\.]+\s*$", line))
 
 
@@ -147,14 +155,17 @@ def parse_transaction_line(
     date_formatted = format_date(date_str.strip())
     rest = rest.strip()
 
-    # Opening balance
     if "OPENING BALANCE" in rest:
         balance = find_monetary_values(rest)
         closing_balance = balance[-1] if balance else "0.00"
         return [
-            date_formatted, "OPENING BALANCE",
-            "0.00", "0.00", closing_balance,
-            line_count, page_number
+            date_formatted,
+            "OPENING BALANCE",
+            "0.00",
+            "0.00",
+            closing_balance,
+            line_count,
+            page_number,
         ]
 
     money_positions = list(re.finditer(MONEY_PATTERN, rest))
@@ -164,11 +175,7 @@ def parse_transaction_line(
         return None
 
     debit, credit, balance, detail = extract_money_fields(rest, money_positions)
-    return [
-        date_formatted, detail.strip(),
-        debit, credit, balance,
-        line_count, page_number
-    ]
+    return [date_formatted, detail.strip(), debit, credit, balance, line_count, page_number]
 
 
 def extract_money_fields(rest: str, matches: List[re.Match]) -> Tuple[str, str, str, str]:
@@ -177,7 +184,6 @@ def extract_money_fields(rest: str, matches: List[re.Match]) -> Tuple[str, str, 
         debit = matches[-3].group()
         credit = matches[-2].group()
         balance = matches[-1].group()
-
         detail = reconstruct_detail(rest, matches[-3:])
         return debit, credit, balance, detail
 
@@ -187,14 +193,13 @@ def extract_money_fields(rest: str, matches: List[re.Match]) -> Tuple[str, str, 
         detail = rest.split(credit, 1)[0].strip()
         return "0.00", credit, balance, detail
 
-    # Only balance present
     balance = matches[0].group()
     detail = rest.split(balance, 1)[0].strip()
     return "0.00", "0.00", balance, detail
 
 
-def reconstruct_detail(rest: str, spans: List[Tuple[int, int]]) -> str:
-    """Remove monetary value segments from the rest of the text to keep only description."""
+def reconstruct_detail(rest: str, spans: List[re.Match]) -> str:
+    """Remove monetary segments from the text to leave only the description."""
     detail = ""
     last_pos = 0
 
@@ -207,7 +212,10 @@ def reconstruct_detail(rest: str, spans: List[Tuple[int, int]]) -> str:
 
 
 def merge_monetary_line(records: List[list], line: str) -> None:
-    """Merge a monetary-only line into the last transaction record."""
+    """
+    Merge a monetary-only line into the last transaction record.
+    Handles two or three number lines (credit/balance or debit/credit/balance).
+    """
     if not records:
         return
 
@@ -218,17 +226,14 @@ def merge_monetary_line(records: List[list], line: str) -> None:
 
     last = records[-1]
 
-    # Two numbers = credit, balance
     if last[2] == "0.00" and last[3] == "0.00" and len(amounts) == 2:
         last[3], last[4] = amounts
         return
 
-    # Three numbers = debit, credit, balance
     if len(amounts) == 3:
         last[2], last[3], last[4] = amounts
         return
 
-    # Fallback: treat as description continuation
     last[1] += " " + line
 
 
@@ -237,9 +242,7 @@ def merge_monetary_line(records: List[list], line: str) -> None:
 # -------------------------------------------------------------------------
 
 def clean_transaction_details(text: str) -> str:
-    """
-    Remove stray header-like words from transaction descriptions.
-    """
+    """Remove stray header-like words from transaction descriptions."""
     words = text.split()
     indices = []
     pos = 0
@@ -260,10 +263,7 @@ def clean_transaction_details(text: str) -> str:
 
 
 def clean_monetary_values(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Correct misparsed monetary columns for cases where balances and credits
-    collapse into one field.
-    """
+    """Correct misparsed monetary columns where balances and credits collapse."""
     for index, row in df.iterrows():
         values = re.findall(MONEY_PATTERN, row["Balance"])
         if len(values) == 2:
@@ -281,20 +281,38 @@ def clean_monetary_values(df: pd.DataFrame) -> pd.DataFrame:
 # Public API
 # -------------------------------------------------------------------------
 
-def convert_pdfs_and_write(pdf_paths: List[str], out_path: str) -> Tuple[bool, str]:
+def convert_pdfs_and_write(
+    pdf_paths: List[str],
+    out_path: str,
+    log_callback: Callable[[str], None] = None,
+) -> Tuple[bool, str]:
     """
     Convert multiple PDFs to a combined DataFrame and write the results
-    to either Excel or CSV.
+    to Excel or CSV.
+
+    Args:
+        pdf_paths: List of PDF file paths.
+        out_path: Output file path (.xlsx, .xls, or .csv).
+        log_callback: Optional function(str) to receive live log messages.
 
     Returns:
-        (success: bool, message: str)
+        Tuple of (success: bool, message: str)
     """
     parsed_frames = []
 
     for path in pdf_paths:
-        df = process_pdf(path)
+        if log_callback:
+            log_callback(f"Extracting from {os.path.basename(path)}")
+
+        def page_cb(page_number: int, total_pages: int):
+            if log_callback:
+                log_callback(f"Extracting page {page_number} of {total_pages}")
+
+        df = process_pdf(path, progress_callback=page_cb)
         df = clean_monetary_values(df)
-        df["Transaction Details"] = df["Transaction Details"].apply(clean_transaction_details)
+        df["Transaction Details"] = df["Transaction Details"].apply(
+            clean_transaction_details
+        )
         parsed_frames.append(df)
 
     if not parsed_frames:
@@ -303,12 +321,18 @@ def convert_pdfs_and_write(pdf_paths: List[str], out_path: str) -> Tuple[bool, s
     combined = pd.concat(parsed_frames, ignore_index=True)
     combined = combined.drop(columns=["Line Count", "Page Number"])
 
-    ext = os.path.splitext(out_path)[1].lower()
+    if log_callback:
+        log_callback(
+            f"Converting to {'Excel' if out_path.endswith(('.xlsx','.xls')) else 'CSV'}"
+        )
 
-    if ext in (".xlsx", ".xls"):
-        with pd.ExcelWriter(out_path) as writer:
-            combined.to_excel(writer, sheet_name="AllData", index=False)
-    else:
-        combined.to_csv(out_path, index=False)
+    try:
+        ext = os.path.splitext(out_path)[1].lower()
+        if ext in (".xlsx", ".xls"):
+            combined.to_excel(out_path, index=False)
+        else:
+            combined.to_csv(out_path, index=False)
+    except Exception as e:
+        return False, f"Failed to write output file: {e}"
 
     return True, f"Saved to {out_path}"
