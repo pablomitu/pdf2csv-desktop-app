@@ -13,12 +13,14 @@ import pandas as pd
 from parser.bpng_parser import BPNGParser
 from parser.bsp_parser import BSPParser
 
+
 class PDFParserDispatcher:
     """Dispatches PDF parsing to the correct parser based on content."""
 
-    def __init__(self, tabula_jar_path: str):
+    def __init__(self):
+        """Initialize parsers - no Tabula JAR needed!"""
         self.bpng_parser = BPNGParser()
-        self.bsp_parser = BSPParser(tabula_jar_path)
+        self.bsp_parser = BSPParser()
 
     def parse_pdfs(
         self,
@@ -40,12 +42,12 @@ class PDFParserDispatcher:
         for pdf_path in pdf_paths:
             parser_type = self._detect_pdf_type(pdf_path)
             if log_callback:
-                log_callback(f"Detected {parser_type} parser for {pdf_path}")
+                log_callback(f"📄 Detected {parser_type} format for {pdf_path}")
 
             if parser_type == "BPNG":
                 def page_cb(page_number, total_pages):
                     if log_callback:
-                        log_callback(f"Processing page {page_number}/{total_pages} of {pdf_path}")
+                        log_callback(f"  Processing page {page_number}/{total_pages}")
 
                 df = self.bpng_parser.parse_pdf(pdf_path, progress_callback=page_cb)
                 all_frames.append(df)
@@ -55,7 +57,7 @@ class PDFParserDispatcher:
                 all_frames.append(df)
             else:
                 if log_callback:
-                    log_callback(f"WARNING: Could not detect parser for {pdf_path}, skipping")
+                    log_callback(f"⚠️  WARNING: Could not detect parser for {pdf_path}, skipping")
 
         if all_frames:
             combined = pd.concat(all_frames, ignore_index=True)

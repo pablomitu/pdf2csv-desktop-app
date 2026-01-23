@@ -3,10 +3,10 @@ GUI application for converting PDF files to CSV or Excel formats
 with drag-and-drop, file selection, and live processing log.
 
 Modern sleek design with improved UX.
+No Java/Tabula dependency - works out of the box!
 """
 
 import os
-import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -34,17 +34,6 @@ COLORS = {
     'drop_zone_hover': '#e0e7ff', # Drop zone hover
 }
 
-# Path to Tabula JAR file - works both in development and when bundled by PyInstaller
-def get_tabula_jar_path():
-    """Get the path to Tabula JAR, works in both dev and PyInstaller bundle."""
-    if getattr(sys, 'frozen', False):
-        base_path = sys._MEIPASS
-    else:
-        base_path = os.path.dirname(__file__)
-    return os.path.join(base_path, "lib", "tabula-1.0.5-jar-with-dependencies.jar")
-
-TABULA_JAR_PATH = get_tabula_jar_path()
-
 
 class PDF2CSVApp:
     """GUI application for converting PDF files to CSV or Excel."""
@@ -54,8 +43,8 @@ class PDF2CSVApp:
         self.pdf_paths = []
         self.is_processing = False
         
-        # Initialize the dispatcher with Tabula JAR path
-        self.dispatcher = PDFParserDispatcher(TABULA_JAR_PATH)
+        # Initialize the dispatcher (no Tabula JAR needed!)
+        self.dispatcher = PDFParserDispatcher()
 
         self._setup_window()
         self._setup_styles()
@@ -119,92 +108,109 @@ class PDF2CSVApp:
         """Create all GUI widgets."""
         # Main container with padding
         main_container = tk.Frame(self.root, bg=COLORS['background'])
-        main_container.pack(fill=tk.BOTH, expand=True, padx=30, pady=20)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=12)
         
-        self._create_header(main_container)
-        self._create_drop_zone(main_container)
-        self._create_action_buttons(main_container)
-        self._create_file_list(main_container)
-        self._create_log_section(main_container)
+        # Top area: header + drop zone + buttons
+        top_container = tk.Frame(main_container, bg=COLORS['background'])
+        top_container.pack(fill=tk.X, pady=(0, 12))
+        self._create_header(top_container)
+        self._create_drop_zone(top_container)
+        self._create_action_buttons(top_container)
+
+        # Middle area: files list and log pane side-by-side
+        middle_container = tk.Frame(main_container, bg=COLORS['background'])
+        middle_container.pack(fill=tk.BOTH, expand=True)
+
+        # Left: file list (vertically stacked)
+        left_pane = tk.Frame(middle_container, bg=COLORS['background'])
+        left_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self._create_file_list(left_pane)
+
+        # Right: live log + progress (vertically stacked)
+        right_pane = tk.Frame(middle_container, bg=COLORS['background'])
+        right_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._create_log_section(right_pane)
 
     def _create_header(self, parent):
         """Create the header section."""
         header_frame = tk.Frame(parent, bg=COLORS['background'])
-        header_frame.pack(fill=tk.X, pady=(0, 20))
+        header_frame.pack(fill=tk.X, pady=(0, 8))
         
         # Title
         title = tk.Label(
             header_frame,
             text="PDF Statement Converter",
-            font=("Segoe UI", 28, "bold"),
+            font=("Segoe UI", 20, "bold"),
             bg=COLORS['background'],
             fg=COLORS['text']
         )
-        title.pack()
+        title.pack(anchor=tk.W)
         
         # Subtitle
         subtitle = tk.Label(
             header_frame,
             text="Convert BPNG & BSP bank statements to Excel or CSV",
-            font=("Segoe UI", 11),
+            font=("Segoe UI", 10),
             bg=COLORS['background'],
             fg=COLORS['text_secondary']
         )
-        subtitle.pack(pady=(5, 0))
+        subtitle.pack(anchor=tk.W, pady=(2, 0))
 
     def _create_drop_zone(self, parent):
         """Create the drag-and-drop zone."""
-        # Container for shadow effect
-        drop_container = tk.Frame(parent, bg=COLORS['background'])
-        drop_container.pack(fill=tk.X, pady=(0, 20))
-        
         # Drop zone
         self.drop_frame = tk.Frame(
-            drop_container,
+            parent,
             bg=COLORS['drop_zone'],
             highlightbackground=COLORS['border'],
-            highlightthickness=2
+            highlightthickness=1
         )
-        self.drop_frame.pack(fill=tk.X, ipady=40)
-        
+        self.drop_frame.pack(fill=tk.X, pady=(10, 10), ipady=12)
+
+        # Layout: icon and label left-aligned
+        left = tk.Frame(self.drop_frame, bg=COLORS['drop_zone'])
+        left.pack(side=tk.LEFT, padx=12, pady=8)
+
         # Icon (using text)
         icon_label = tk.Label(
-            self.drop_frame,
+            left,
             text="📄",
-            font=("Segoe UI", 48),
+            font=("Segoe UI", 36),
             bg=COLORS['drop_zone']
         )
-        icon_label.pack(pady=(20, 10))
-        
-        # Drop text
+        icon_label.pack(side=tk.LEFT, padx=(0, 12))
+
+        # Texts
+        text_container = tk.Frame(self.drop_frame, bg=COLORS['drop_zone'])
+        text_container.pack(side=tk.LEFT, padx=6, pady=8)
+
         drop_label = tk.Label(
-            self.drop_frame,
+            text_container,
             text="Drag & Drop PDF files here",
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
             bg=COLORS['drop_zone'],
             fg=COLORS['text']
         )
-        drop_label.pack()
-        
-        # Subtext
+        drop_label.pack(anchor=tk.W)
+
         drop_subtext = tk.Label(
-            self.drop_frame,
-            text="or use the button below to browse",
-            font=("Segoe UI", 10),
+            text_container,
+            text="or use the Browse Files button below to select PDFs",
+            font=("Segoe UI", 9),
             bg=COLORS['drop_zone'],
             fg=COLORS['text_secondary']
         )
-        drop_subtext.pack(pady=(5, 20))
+        drop_subtext.pack(anchor=tk.W, pady=(4, 0))
 
     def _create_action_buttons(self, parent):
         """Create action buttons."""
         btn_frame = tk.Frame(parent, bg=COLORS['background'])
-        btn_frame.pack(fill=tk.X, pady=(0, 20))
+        btn_frame.pack(fill=tk.X, pady=(0, 8))
         
         # Center the buttons
         btn_container = tk.Frame(btn_frame, bg=COLORS['background'])
         btn_container.pack()
-        
+
         # Browse button
         self.browse_btn = ttk.Button(
             btn_container,
@@ -212,7 +218,7 @@ class PDF2CSVApp:
             command=self.select_files,
             style='Primary.TButton'
         )
-        self.browse_btn.grid(row=0, column=0, padx=8)
+        self.browse_btn.grid(row=0, column=0, padx=6)
         
         # Convert button
         self.convert_btn = ttk.Button(
@@ -221,7 +227,7 @@ class PDF2CSVApp:
             command=self.convert_files,
             style='Success.TButton'
         )
-        self.convert_btn.grid(row=0, column=1, padx=8)
+        self.convert_btn.grid(row=0, column=1, padx=6)
         
         # Clear button
         self.clear_btn = ttk.Button(
@@ -230,17 +236,17 @@ class PDF2CSVApp:
             command=self.clear_list,
             style='Danger.TButton'
         )
-        self.clear_btn.grid(row=0, column=2, padx=8)
+        self.clear_btn.grid(row=0, column=2, padx=6)
 
     def _create_file_list(self, parent):
         """Create file list section."""
         list_frame = tk.Frame(parent, bg=COLORS['background'])
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
-        
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
         # Header
         list_header = tk.Frame(list_frame, bg=COLORS['background'])
-        list_header.pack(fill=tk.X, pady=(0, 10))
-        
+        list_header.pack(fill=tk.X, pady=(0, 8))
+
         files_label = tk.Label(
             list_header,
             text="Selected Files",
@@ -249,7 +255,7 @@ class PDF2CSVApp:
             fg=COLORS['text']
         )
         files_label.pack(side=tk.LEFT)
-        
+
         self.status_label = tk.Label(
             list_header,
             text="No files selected",
@@ -258,7 +264,7 @@ class PDF2CSVApp:
             fg=COLORS['text_secondary']
         )
         self.status_label.pack(side=tk.RIGHT)
-        
+
         # Listbox with scrollbar
         list_container = tk.Frame(
             list_frame,
@@ -267,10 +273,10 @@ class PDF2CSVApp:
             highlightthickness=1
         )
         list_container.pack(fill=tk.BOTH, expand=True)
-        
+
         scrollbar = tk.Scrollbar(list_container)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         self.file_listbox = tk.Listbox(
             list_container,
             yscrollcommand=scrollbar.set,
@@ -283,36 +289,61 @@ class PDF2CSVApp:
             selectbackground=COLORS['primary'],
             selectforeground='white'
         )
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
         scrollbar.config(command=self.file_listbox.yview)
 
     def _create_log_section(self, parent):
-        """Create log section."""
-        log_frame = tk.Frame(parent, bg=COLORS['background'])
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Header
+        """Create live log section with progress bar and controls."""
+        log_outer = tk.Frame(parent, bg=COLORS['background'])
+        log_outer.pack(fill=tk.BOTH, expand=True)
+
+        # Header + controls
+        header_frame = tk.Frame(log_outer, bg=COLORS['background'])
+        header_frame.pack(fill=tk.X, pady=(0, 6))
+
         log_header = tk.Label(
-            log_frame,
-            text="Processing Log",
+            header_frame,
+            text="Live Processing Log",
             font=("Segoe UI", 12, "bold"),
             bg=COLORS['background'],
             fg=COLORS['text']
         )
-        log_header.pack(anchor=tk.W, pady=(0, 10))
-        
+        log_header.pack(side=tk.LEFT)
+
+        # Buttons: Clear Log, Export Log, Pop-out
+        controls = tk.Frame(header_frame, bg=COLORS['background'])
+        controls.pack(side=tk.RIGHT)
+
+        clear_log_btn = ttk.Button(controls, text="Clear Log", command=self.clear_log)
+        clear_log_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        export_log_btn = ttk.Button(controls, text="Export Log", command=self.export_log)
+        export_log_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        popout_btn = ttk.Button(controls, text="Pop Out", command=self.popout_log)
+        popout_btn.pack(side=tk.RIGHT, padx=(6, 0))
+
+        # Progress bar (indeterminate while processing)
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress = ttk.Progressbar(
+            log_outer,
+            orient="horizontal",
+            mode="indeterminate",
+            variable=self.progress_var,
+            maximum=100
+        )
+        self.progress.pack(fill=tk.X, padx=6, pady=(0, 8))
+
         # Log text with scrollbar
         log_container = tk.Frame(
-            log_frame,
+            log_outer,
             bg=COLORS['surface'],
             highlightbackground=COLORS['border'],
             highlightthickness=1
         )
-        log_container.pack(fill=tk.BOTH, expand=True)
-        
+        log_container.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
         log_scrollbar = tk.Scrollbar(log_container)
         log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         self.log_text = tk.Text(
             log_container,
             yscrollcommand=log_scrollbar.set,
@@ -323,9 +354,9 @@ class PDF2CSVApp:
             borderwidth=0,
             highlightthickness=0,
             state=tk.DISABLED,
-            height=8
+            height=12
         )
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=8)
         log_scrollbar.config(command=self.log_text.yview)
 
     def log_message(self, message: str):
@@ -338,6 +369,59 @@ class PDF2CSVApp:
         
         # Ensure thread-safe GUI updates
         self.root.after(0, update)
+
+    def clear_log(self):
+        """Clear the live log."""
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.log_message("✓ Log cleared")
+
+    def export_log(self):
+        """Export the current log to a text file."""
+        log_content = self.log_text.get("1.0", tk.END).strip()
+        if not log_content:
+            messagebox.showinfo("Export Log", "Log is empty — nothing to export.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+            title="Save Log As"
+        )
+        if not save_path:
+            return
+
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(log_content)
+            messagebox.showinfo("Export Log", f"Log exported to {os.path.basename(save_path)}")
+        except Exception as e:
+            messagebox.showerror("Export Log", f"Failed to save log: {e}")
+
+    def popout_log(self):
+        """Open the log in a separate window for easier reading."""
+        pop = tk.Toplevel(self.root)
+        pop.title("Live Log - Popout")
+        pop.geometry("700x500")
+        pop.configure(bg=COLORS['background'])
+
+        txt = tk.Text(pop, wrap=tk.WORD, font=("Consolas", 10), bg=COLORS['surface'], fg=COLORS['text'])
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # copy current contents
+        content = self.log_text.get("1.0", tk.END)
+        txt.insert("1.0", content)
+
+        # live mirror: append future messages to popout as well
+        def mirror_update():
+            current = self.log_text.get("1.0", tk.END)
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", current)
+            txt.see(tk.END)
+            pop.after(500, mirror_update)
+
+        mirror_update()
 
     # ------------------------------------------------------------------
     # Drag & Drop Setup
@@ -353,13 +437,19 @@ class PDF2CSVApp:
         """Visual feedback when dragging over drop zone."""
         self.drop_frame.configure(bg=COLORS['drop_zone_hover'])
         for widget in self.drop_frame.winfo_children():
-            widget.configure(bg=COLORS['drop_zone_hover'])
+            try:
+                widget.configure(bg=COLORS['drop_zone_hover'])
+            except Exception:
+                pass
 
     def on_drag_leave(self, event):
         """Reset visual feedback when leaving drop zone."""
         self.drop_frame.configure(bg=COLORS['drop_zone'])
         for widget in self.drop_frame.winfo_children():
-            widget.configure(bg=COLORS['drop_zone'])
+            try:
+                widget.configure(bg=COLORS['drop_zone'])
+            except Exception:
+                pass
 
     def on_drop(self, event):
         """Handle PDF files dropped into the drop zone."""
@@ -465,11 +555,17 @@ class PDF2CSVApp:
         self.convert_btn.config(state='disabled')
         self.clear_btn.config(state='disabled')
 
+        # start progress indicator
+        try:
+            self.progress.start(10)
+        except Exception:
+            pass
+
         def process_pdfs():
             try:
-                self.log_message("━" * 60)
+                self.log_message("=" * 60)
                 self.log_message("Starting PDF processing...")
-                self.log_message("━" * 60)
+                self.log_message("=" * 60)
                 
                 # Use dispatcher to parse PDFs (auto-detects BPNG vs BSP)
                 df = self.dispatcher.parse_pdfs(
@@ -491,10 +587,10 @@ class PDF2CSVApp:
                 else:
                     df.to_csv(save_path, index=False)
                 
-                self.log_message("━" * 60)
+                self.log_message("=" * 60)
                 self.log_message(f"✓ SUCCESS! Exported {len(df)} transactions")
                 self.log_message(f"📁 Saved to: {save_path}")
-                self.log_message("━" * 60)
+                self.log_message("=" * 60)
                 
                 messagebox.showinfo(
                     "Success", 
@@ -503,17 +599,18 @@ class PDF2CSVApp:
                     f"Saved to: {os.path.basename(save_path)}"
                 )
                 
-            except FileNotFoundError as e:
-                error_msg = f"Missing dependency: {str(e)}\n\nMake sure Tabula JAR and Java are installed."
-                self.log_message(f"✗ ERROR: {error_msg}")
-                messagebox.showerror("Dependency Error", error_msg)
-                
             except Exception as e:
                 error_msg = f"Processing failed: {str(e)}"
                 self.log_message(f"✗ ERROR: {error_msg}")
                 messagebox.showerror("Error", error_msg)
                 
             finally:
+                # stop progress indicator
+                try:
+                    self.progress.stop()
+                except Exception:
+                    pass
+
                 self.pdf_paths = []
                 self.update_status()
                 self.is_processing = False

@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
+*.ipynb
 # --- Virtual environments ---
 venv/
 env/
