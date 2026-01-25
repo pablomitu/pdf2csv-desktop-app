@@ -39,9 +39,13 @@ pdf2csv-desktop-app/
 │ ├── pdf2csv_desktop.py # GUI application
 │ ├── parser/
 │ │ ├── parser_logic.py # PDF parsing and cleaning logic
-│ │ └── init.py
-│ └── output/ # optional temporary output
-│
+│ │ └── __init__.py
+| | └── base_parser.py # abstract base class
+| | └── bpng_parser.py # parser for BPNG PDFs
+| | └── bsp_parser.py # parser for BSP PDFs
+| | └── dispatcher.py # dispatches PDF Parsing to correct parser based on PDF contents
+| | ├── __pycache__/
+├── pdf2csv_desktop.spec # requirements for building app
 ├── requirements.txt
 ├── README.md
 └── .gitignore
