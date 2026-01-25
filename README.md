@@ -74,5 +74,13 @@ venv\Scripts\activate
 
 ---
 
-### 4. Run the application
-`python src/pdf2csv_desktop.py`
+### 4. Build App
+`pyinstaller pdf2csv_desktop.spec`
+
+---
+### 5. Run the application
+`python pdf2csv-desktop-app/dist/pdf2csv_desktop.py`
+
+---
+
+
