@@ -1,456 +1,456 @@
+# parser/bsp_parser.py
+"""
+Unified parser for BSP (Bank of South Pacific) statements. Auto-detects
+which of the two known BSP table layouts a given PDF uses (by looking
+for either format's column-header line) and runs the matching clean +
+convert pipeline. This replaces the previous balance-delta-reconciliation
+approach for the DATE/VALUE DATE layout, and the separate
+BSPNarrativeParser for the Posting Date/Narrative layout — both are now
+handled by this single class, mirroring the standalone pdf_to_csv.py
+reference script this was lifted from.
+
+FORMAT 1 — 7 columns (Posting Date / Effective Date / Cheque Sr. No. /
+           Narrative / Debit / Credit / Balance)
+    Header:  "     Date        Date      Sr. No.  Narrative   Debit   Credit   Balance "
+    Ends at: a line like "Account Transaction List ... Page : N"
+    Output:
+        Posting Date / Effective Date -> Date (DD/MM/YYYY)
+        Cheque Sr. No.                -> Integer (or "" if none)
+        Narrative                     -> Text
+        Debit / Credit / Balance      -> Decimal (float)
+
+FORMAT 2 — 6 columns (DATE / VALUE DATE / DESCRIPTION / DEBIT / CREDIT / BALANCE)
+    Header:  "   DATE   VALUE DATE   DESCRIPTION   DEBIT   CREDIT   BALANCE "
+    Ends at: a line starting with "Totals"
+    Output:
+        DATE / VALUE DATE           -> Text, left as extracted (DD-MMM-YYYY)
+        DESCRIPTION                 -> Text
+        DEBIT / CREDIT / BALANCE    -> Text (NVARCHAR-style; trailing "-"
+                                       for negatives is preserved, not
+                                       converted to a signed float)
+
+Uses pdfminer.six for text extraction (rather than pdfplumber, used by
+the other parsers), since both formats' debit/credit column splits rely
+on character x-position data calibrated against pdfminer's layout output.
+"""
+
 import re
-from decimal import Decimal
-from typing import List, Optional, Callable
+from datetime import datetime
+from typing import Callable, List, Optional
 
-import pdfplumber
 import pandas as pd
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTTextContainer
+
+from .base_parser import BaseParser
 
 
-class BSPParser:
-    """
-    Cleaned, single-definition BSP (Bank of South Pacific) statement parser.
+class BSPParser(BaseParser):
+    """Unified parser for both known BSP statement layouts."""
 
-    Responsibilities:
-    - Detect whether a PDF looks like a BSP statement
-    - Extract transaction-area lines from the PDF
-    - Group multi-line transactions
-    - Parse dates, descriptions, and amounts
-    - Fix split monetary values (e.g. 2,224,385. + 99)
-    - Reconcile debit / credit using running balances
-    """
+    # ------------------------------------------------------------------
+    # Format detection
+    # ------------------------------------------------------------------
+    FORMAT1_START_RE = re.compile(
+        r"Date\s+Date\s+Sr\.?\s*No\.?\s+Narrative\s+Debit\s+Credit\s+Balance",
+        re.IGNORECASE,
+    )
+    FORMAT2_START_RE = re.compile(
+        r"DATE\s+VALUE\s+DATE\s+DESCRIPTION\s+DEBIT\s+CREDIT\s+BALANCE",
+        re.IGNORECASE,
+    )
 
-    # --- regex patterns ---
-    DATE_PATTERN = re.compile(r"^\d{2}-[A-Z]{3}-\d{4}$")
-    MONEY_PATTERN = re.compile(r"-?\d{1,3}(?:,\d{3})*\.\d{2}")
-    INCOMPLETE_MONEY_PATTERN = re.compile(r"-?\d{1,3}(?:,\d{3})*\.$")
-    DECIMAL_PART_PATTERN = re.compile(r"^\d{2}$")
-    INTEGER_MONEY_IN_DESC = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
+    # ------------------------------------------------------------------
+    # Format 1 patterns / columns
+    # ------------------------------------------------------------------
+    F1_END_MARKER_RE = re.compile(
+        r"Account\s+Transactions?\s+List.*Page\s*:\s*\d+",
+        re.IGNORECASE,
+    )
+    F1_PAGE_BREAK_RE = re.compile(r"^\s*-+\s*Page\s+\d+\s*-+\s*$", re.IGNORECASE)
 
-    # sentinel used to mark totals/footer lines in the preprocessed line list
-    TOTALS_SENTINEL = "__BSP_TOTALS__"
+    F1_COLUMNS = [
+        "Posting Date",
+        "Effective Date",
+        "Cheque Sr. No.",
+        "Narrative",
+        "Debit",
+        "Credit",
+        "Balance",
+    ]
+    F1_DATE_RE = re.compile(r"\d{1,2}/\d{2}/\d{4}")
+    F1_AMOUNT_RE = re.compile(r"\d[\d,]*\.\d{2}|\.\d{2}")
+    F1_COLUMN_SPLIT = 95  # Debit/Credit boundary, calibrated from sample data
 
+    # ------------------------------------------------------------------
+    # Format 2 patterns / columns
+    # ------------------------------------------------------------------
+    F2_END_MARKER_RE = re.compile(r"^\s*Totals\b", re.IGNORECASE)
+    F2_ABOUT_BLANK_RE = re.compile(r"^\s*about:blank\s*$", re.IGNORECASE)
+    F2_PAGE_BREAK_RE = re.compile(r"^\s*-+\s*Page\s+\d+\s*-+\s*$", re.IGNORECASE)
+    F2_PAGE_NUMBER_RE = re.compile(r"^\s*\d+\s*/\s*\d+\s*$")
+    F2_TIMESTAMP_RE = re.compile(
+        r"^\s*\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}:\d{2}\s*(AM|PM)\s*$",
+        re.IGNORECASE,
+    )
+    F2_EQUALS_SEPARATOR_RE = re.compile(r"^[\s=]+$")
+    F2_DASH_SEPARATOR_RE = re.compile(r"^[\s\-]+$")
+
+    F2_COLUMNS = ["DATE", "VALUE DATE", "DESCRIPTION", "DEBIT", "CREDIT", "BALANCE"]
+    F2_DATE_RE = re.compile(r"\d{1,2}-[A-Za-z]{3}-\d{4}")
+    F2_AMOUNT_RE = re.compile(r"\d[\d,]*\.\d{2}-?")
+    F2_R_FLAG_RE = re.compile(r"^\s*R\s+")
+    F2_COLUMN_SPLIT = 75  # Debit/Credit boundary, calibrated from sample data
+
+    # ------------------------------------------------------------------
+    # BaseParser interface
+    # ------------------------------------------------------------------
     def can_parse(self, pdf_text: str) -> bool:
-        """Quick heuristic to check if this looks like a BSP statement."""
-        text = pdf_text.upper()
-        return "BANK OF SOUTH PACIFIC" in text or "BSP" in text
+        """Return True if either known BSP table header appears."""
+        return bool(
+            self.FORMAT1_START_RE.search(pdf_text)
+            or self.FORMAT2_START_RE.search(pdf_text)
+        )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
     def parse_pdf(
         self,
         pdf_path: str,
         progress_callback: Optional[Callable[[str], None]] = None,
     ) -> pd.DataFrame:
         """
-        Main entry point.
-        Returns a DataFrame with columns:
-        DATE, VALUE DATE, DESCRIPTION, DEBIT, CREDIT, BALANCE
+        Parse a BSP PDF, auto-detecting which of the two known layouts
+        it uses, and return the corresponding DataFrame.
         """
-        all_lines: List[str] = []
-        capture = False
-        finished = False
+        if progress_callback:
+            progress_callback("Extracting text")
+        raw_text = self._extract_raw_text(pdf_path)
 
-        with pdfplumber.open(pdf_path) as pdf:
-            for page_idx, page in enumerate(pdf.pages, start=1):
-                if finished:
-                    break
-                if progress_callback:
-                    progress_callback(f"Processing page {page_idx}/{len(pdf.pages)}")
+        fmt = self._detect_format(raw_text)
+        if fmt is None:
+            if progress_callback:
+                progress_callback(
+                    "Could not detect BSP statement format (no known "
+                    "table header found)"
+                )
+            return pd.DataFrame()
 
-                text = page.extract_text() or ""
-                lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        if progress_callback:
+            progress_callback(f"Detected BSP Format {fmt}")
+            progress_callback("Finding transaction tables")
 
-                for line in lines:
-                    header = line.upper()
-                    # detect header once (document-scoped)
-                    if (
-                        not capture
-                        and "DATE" in header
-                        and "VALUE" in header
-                        and "DESCRIPTION" in header
-                    ):
-                        capture = True
-                        continue
+        if fmt == 1:
+            kept_lines, _ = self._f1_clean_lines(raw_text)
+            if progress_callback:
+                progress_callback("Converting to transaction rows")
+            rows = self._f1_build_rows(kept_lines)
+            return pd.DataFrame(rows, columns=self.F1_COLUMNS)
 
-                    if not capture:
-                        continue
-
-                    stripped = header.strip()
-
-                    # conservative end-of-statement detection: only explicit labels
-                    end_markers = (
-                        "END OF STATEMENT",
-                        "END OF PERIOD",
-                        "CLOSING BALANCE",
-                        "ENDING BALANCE",
-                        "STATEMENT TOTAL",
-                    )
-                    if any(m in stripped for m in end_markers):
-                        finished = True
-                        break
-
-                    # skip obvious column separator lines (dashes) and page numbers
-                    if set(stripped) <= set("- "):
-                        continue
-                    if stripped.isdigit():
-                        continue
-
-                    # if this line is a totals/footer line, append a sentinel so the
-                    # transaction parser can stop at that boundary. We still skip adding
-                    # the actual totals text to the transaction lines.
-                    if stripped.startswith("TOTAL") or stripped.startswith("TOTALS") or stripped.startswith("===="):
-                        all_lines.append(self.TOTALS_SENTINEL)
-                        continue
-
-                    all_lines.append(line)
-
-        # fix split monetary values BEFORE transaction grouping
-        all_lines = self._fix_incomplete_amounts(all_lines)
-
-        records = self._parse_transactions(all_lines)
-        df = pd.DataFrame(records)
-
-        if df.empty:
-            return df
-
-        df = self._fix_debit_credit_columns(df)
-        df = self._extract_amounts_from_description(df)
-        df["DESCRIPTION"] = df["DESCRIPTION"].apply(self._clean_description)
-
-        # ensure columns exist
-        for col in ["DEBIT", "CREDIT", "BALANCE", "DESCRIPTION", "DATE", "VALUE DATE"]:
-            if col not in df.columns:
-                df[col] = None
-
-        return df[[
-            "DATE",
-            "VALUE DATE",
-            "DESCRIPTION",
-            "DEBIT",
-            "CREDIT",
-            "BALANCE",
-        ]]
+        kept_lines, _ = self._f2_clean_lines(raw_text)
+        if progress_callback:
+            progress_callback("Converting to transaction rows")
+        rows = self._f2_build_rows(kept_lines)
+        return pd.DataFrame(rows, columns=self.F2_COLUMNS)
 
     # ------------------------------------------------------------------
-    # Line & transaction parsing
+    # Stage 1: EXTRACT (shared)
     # ------------------------------------------------------------------
-    def _parse_transactions(self, lines: List[str]) -> List[dict]:
-        """
-        Parse transactions from a list of preprocessed lines.
-        We operate on a local copy of lines so we can safely mutate as needed
-        (e.g. when a value date is on the next line).
-
-        This version treats the TOTALS_SENTINEL as a hard boundary that stops the
-        current transaction's description (and is skipped from output).
-        """
-        records = []
-        work_lines = list(lines)  # local copy so modifications don't leak
-        i = 0
-        while i < len(work_lines):
-            # skip sentinel lines at top-level
-            if work_lines[i] == self.TOTALS_SENTINEL:
-                i += 1
-                continue
-
-            parts = work_lines[i].split()
-
-            # Detect start of transaction by FIRST date only (BSP debits often wrap)
-            if parts and self.DATE_PATTERN.match(parts[0]):
-                date = parts[0]
-
-                # Resolve value date
-                if len(parts) > 1 and self.DATE_PATTERN.match(parts[1]):
-                    value_date = parts[1]
-                    consumed_next_line_remainder = None
-                else:
-                    # value date is on the next line
-                    if i + 1 >= len(work_lines):
-                        i += 1
-                        continue
-                    next_parts = work_lines[i + 1].split()
-                    if not next_parts or not self.DATE_PATTERN.match(next_parts[0]):
-                        i += 1
-                        continue
-                    value_date = next_parts[0]
-                    consumed_next_line_remainder = " ".join(next_parts[1:]) if len(next_parts) > 1 else ""
-                    work_lines[i + 1] = consumed_next_line_remainder
-
-                # gather transaction lines (first line + continuations)
-                tx_lines = [work_lines[i]]
-                i += 1
-                while i < len(work_lines):
-                    # stop when we see the start of a new dated transaction
-                    nxt = work_lines[i].split()
-                    if nxt and self.DATE_PATTERN.match(nxt[0]):
-                        break
-
-                    # stop if we hit the totals sentinel or a totals-like line
-                    stripped_nxt = work_lines[i].strip().upper()
-                    if (
-                        work_lines[i] == self.TOTALS_SENTINEL
-                        or stripped_nxt.startswith("TOTAL")
-                        or stripped_nxt.startswith("TOTALS")
-                        or stripped_nxt.startswith("====")
-                    ):
-                        # do not consume the totals sentinel here; break so outer loop
-                        # can skip it safely
-                        break
-
-                    tx_lines.append(work_lines[i])
-                    i += 1
-
-                # parse single transaction (first-line-only amount extraction)
-                record = self._parse_single_transaction(date, value_date, tx_lines)
-                records.append(record)
-            else:
-                i += 1
-
-        return records
-
-    def _parse_single_transaction(
-        self, date: str, value_date: str, lines: List[str]
-    ) -> dict:
-        # Only extract monetary amounts from the FIRST line of the transaction
-        first_line = lines[0]
-        amounts = self.MONEY_PATTERN.findall(first_line)
-
-        # Build description from all lines, then remove only the amounts we extracted
-        description = " ".join(lines)
-        description = description.replace(date, "").replace(value_date, "")
-        for amt in amounts:
-            description = description.replace(amt, "", 1)
-
-        record = {
-            "DATE": date,
-            "VALUE DATE": value_date,
-            "DESCRIPTION": description.strip(),
-            "DEBIT": None,
-            "CREDIT": None,
-            "BALANCE": None,
-        }
-
-        # BSP-safe assignment:
-        # - Always set BALANCE to the last money token on the first line (if present)
-        # - Keep the first amount as an internal hint for first-row inference
-        if amounts:
-            record["BALANCE"] = amounts[-1]
-            if len(amounts) >= 2:
-                record["_first_amount"] = amounts[0]  # internal/debug use only
-
-        return record
+    def _extract_raw_text(self, pdf_path: str) -> str:
+        chunks = []
+        for page_num, page_layout in enumerate(extract_pages(pdf_path), start=1):
+            page_text_parts = [
+                element.get_text()
+                for element in page_layout
+                if isinstance(element, LTTextContainer)
+            ]
+            page_text = "".join(page_text_parts).strip("\n")
+            chunks.append(f"--- Page {page_num} ---\n{page_text}")
+        return "\n".join(chunks)
 
     # ------------------------------------------------------------------
-    # Fixes & reconciliation
+    # Format detection
     # ------------------------------------------------------------------
-    def _fix_incomplete_amounts(self, lines: List[str]) -> List[str]:
+    def _detect_format(self, raw_text: str) -> Optional[int]:
         """
-        Improved merging of incomplete monetary tokens that may span lines.
-
-        - Looks for tokens that end with a trailing dot (e.g. '5,468,862.') anywhere in
-          the token list for the line (not only the last token).
-        - Searches subsequent lines for the first token that looks like a 2-digit
-          decimal part (e.g. '39') and attaches it.
-        - If no exact two-digit match is found, will accept a short numeric token.
-        - Removes the attached token from its original place, preserving other tokens.
+        Scan the extracted text line by line and return 1 or 2 depending
+        on which format's column-header line is found first. Returns
+        None if neither is found.
         """
-        fixed: List[str] = []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            tokens = line.split()
-
-            # find any token in the line that is an incomplete money (ends with '.')
-            idx = None
-            for t_idx, tok in enumerate(tokens):
-                if self.INCOMPLETE_MONEY_PATTERN.match(tok):
-                    idx = t_idx
-                    break
-
-            if idx is not None:
-                incomplete = tokens[idx]
-                combined = incomplete
-                merged = False
-                j = i + 1
-                while j < len(lines):
-                    next_tokens = lines[j].split()
-                    if not next_tokens:
-                        j += 1
-                        continue
-
-                    # prefer an exact 2-digit token (safe decimal suffix)
-                    found_k = None
-                    for k, tok in enumerate(next_tokens):
-                        if self.DECIMAL_PART_PATTERN.match(tok):
-                            found_k = k
-                            break
-
-                    if found_k is not None:
-                        combined = combined + next_tokens[found_k]
-                        next_tokens.pop(found_k)
-                        lines[j] = " ".join(next_tokens) if next_tokens else ""
-                        merged = True
-                        break
-
-                    # otherwise accept a short numeric token (e.g. '39' not at position 0)
-                    for k, tok in enumerate(next_tokens):
-                        if tok.isdigit() and 1 <= len(tok) <= 3:
-                            found_k = k
-                            break
-                    if found_k is not None:
-                        combined = combined + next_tokens[found_k]
-                        next_tokens.pop(found_k)
-                        lines[j] = " ".join(next_tokens) if next_tokens else ""
-                        merged = True
-                        break
-
-                    j += 1
-
-                if merged:
-                    tokens[idx] = combined
-                    fixed.append(" ".join(tokens))
-                    # we consumed tokens from line j; include remainder of that line if any
-                    if j < len(lines) and lines[j].strip():
-                        fixed.append(lines[j])
-                    # advance pointer past the merged token line
-                    i = j + 1
-                    continue
-
-            # nothing to merge here
-            fixed.append(line)
-            i += 1
-
-        # remove empty lines
-        fixed = [ln for ln in fixed if ln is not None and ln.strip()]
-        return fixed
-
-    def _fix_debit_credit_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        def to_dec(v):
-            if v in (None, ""):
-                return None
-            try:
-                return Decimal(v.replace(",", ""))
-            except Exception:
-                return None
-
-        df = df.copy()
-
-        # helper decimals
-        df["_bal"] = df["BALANCE"].apply(to_dec)
-        df["_dr"] = df["DEBIT"].apply(to_dec)
-        df["_cr"] = df["CREDIT"].apply(to_dec)
-
-        # also convert any internal first-amount hint
-        if "_first_amount" in df.columns:
-            df["_first_dec"] = df["_first_amount"].apply(to_dec)
-        else:
-            df["_first_dec"] = None
-
-        for i in range(len(df)):
-            # skip rows without balances
-            if df.loc[i, "_bal"] is None:
-                continue
-
-            curr = df.loc[i, "_bal"]
-
-            # FIRST ROW special handling: use _first_dec hint if present
-            if i == 0:
-                first_amt = df.loc[i, "_first_dec"] if "_first_dec" in df.columns else None
-                # only infer if debit/credit are missing and we have a first-amount hint
-                if (df.loc[i, "_dr"] is None or df.loc[i, "_dr"] == 0) and (
-                    df.loc[i, "_cr"] is None or df.loc[i, "_cr"] == 0
-                ) and first_amt is not None:
-                    # guess previous balance = current - first_amt
-                    prev_guess = None
-                    try:
-                        prev_guess = curr - first_amt
-                    except Exception:
-                        prev_guess = None
-
-                    # If prev_guess is non-negative, treat first_amt as CREDIT (balance increased).
-                    # Otherwise treat as DEBIT.
-                    if prev_guess is not None and prev_guess >= Decimal("0"):
-                        df.loc[i, "CREDIT"] = f"{first_amt:,.2f}"
-                    else:
-                        df.loc[i, "DEBIT"] = f"{abs(first_amt):,.2f}"
-                # cannot compute delta for first row otherwise
-                continue
-
-            # for subsequent rows compute delta using previous balance
-            prev = df.loc[i - 1, "_bal"]
-            if prev is None:
-                continue
-
-            delta = curr - prev
-
-            # if one side present but sign disagrees, swap
-            if df.loc[i, "_cr"] and not df.loc[i, "_dr"]:
-                if delta < 0:
-                    df.loc[i, "DEBIT"] = df.loc[i, "CREDIT"]
-                    df.loc[i, "CREDIT"] = None
-
-            elif df.loc[i, "_dr"] and not df.loc[i, "_cr"]:
-                if delta > 0:
-                    df.loc[i, "CREDIT"] = df.loc[i, "DEBIT"]
-                    df.loc[i, "DEBIT"] = None
-
-            # If neither DEBIT nor CREDIT present, infer from balance delta
-            if (df.loc[i, "_dr"] is None or df.loc[i, "_dr"] == 0) and (
-                df.loc[i, "_cr"] is None or df.loc[i, "_cr"] == 0
-            ):
-                if delta > 0:
-                    # balance increased -> credit
-                    amt = delta
-                    df.loc[i, "CREDIT"] = f"{amt:,.2f}"
-                elif delta < 0:
-                    amt = abs(delta)
-                    df.loc[i, "DEBIT"] = f"{amt:,.2f}"
-
-        # clean up helper columns
-        drop_cols = ["_bal", "_dr", "_cr", "_first_dec", "_first_amount"]
-        for c in drop_cols:
-            if c in df.columns:
-                df = df.drop(columns=[c])
-
-        return df
-
-    def _extract_amounts_from_description(self, df: pd.DataFrame) -> pd.DataFrame:
-        def to_dec(v):
-            if v in (None, ""):
-                return None
-            try:
-                return Decimal(v.replace(",", ""))
-            except Exception:
-                return None
-
-        df = df.copy()
-        df["_bal"] = df["BALANCE"].apply(to_dec)
-
-        for i in range(1, len(df)):
-            # skip if debit/credit already present
-            if df.loc[i, "DEBIT"] or df.loc[i, "CREDIT"]:
-                continue
-
-            bal = df.loc[i, "_bal"]
-            prev = df.loc[i - 1, "_bal"]
-            if bal is None or prev is None:
-                continue
-
-            diff = bal - prev
-            if diff == 0:
-                continue
-
-            amt = abs(diff)
-            if diff < 0:
-                df.loc[i, "DEBIT"] = f"{amt:,.2f}"
-            else:
-                df.loc[i, "CREDIT"] = f"{amt:,.2f}"
-
-        return df.drop(columns=["_bal"])
+        for line in raw_text.splitlines():
+            if self.FORMAT1_START_RE.search(line):
+                return 1
+            if self.FORMAT2_START_RE.search(line):
+                return 2
+        return None
 
     # ------------------------------------------------------------------
-    # Utilities
+    # Shared helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _clean_description(text: str) -> str:
-        return " ".join(text.replace('"', "").split())
+    def _collapse_spaces(text: str) -> str:
+        """Collapse runs of whitespace into single spaces for a clean field."""
+        return re.sub(r"\s+", " ", text).strip()
+
+    # ==================================================================
+    # FORMAT 1 — clean + convert
+    # ==================================================================
+    def _f1_clean_lines(self, raw_text: str):
+        kept_lines: List[str] = []
+        inside_table = False
+        table_count = 0
+
+        for raw_line in raw_text.splitlines():
+            line = raw_line.rstrip("\n")
+
+            if not inside_table:
+                if self.FORMAT1_START_RE.search(line):
+                    inside_table = True
+                    table_count += 1
+                continue
+
+            if self.F1_END_MARKER_RE.search(line):
+                inside_table = False
+                continue
+
+            if self.F1_PAGE_BREAK_RE.match(line):
+                continue
+
+            if not line.strip():
+                continue
+
+            kept_lines.append(line)
+
+        return kept_lines, table_count
+
+    @staticmethod
+    def _f1_normalize_date(raw: str) -> str:
+        """Convert D/MM/YYYY or DD/MM/YYYY to zero-padded DD/MM/YYYY."""
+        dt = datetime.strptime(raw, "%d/%m/%Y")
+        return dt.strftime("%d/%m/%Y")
+
+    @staticmethod
+    def _f1_normalize_amount(raw: str) -> float:
+        """Convert '1,690.49' or '.25' into a float."""
+        return float(raw.replace(",", ""))
+
+    def _f1_extract_cheque_no(self, text: str):
+        """
+        If the text starts with a standalone SHORT number (digits only,
+        at most 4 digits) followed by real narrative text, treat that
+        number as the Cheque Sr. No. and return the remaining text as
+        the Narrative.
+        """
+        tokens = text.split(None, 1)
+        has_trailing_text = len(tokens) > 1 and tokens[1].strip()
+
+        if tokens and tokens[0].isdigit() and len(tokens[0]) <= 4 and has_trailing_text:
+            cheque_no = int(tokens[0])
+            narrative = tokens[1].strip()
+            return cheque_no, self._collapse_spaces(narrative)
+
+        return "", self._collapse_spaces(text)
+
+    def _f1_parse_line(self, line: str):
+        """
+        Parse a single line into a Format-1 row dict, or return None
+        if it has no date (a narrative-continuation line).
+        """
+        dates = list(self.F1_DATE_RE.finditer(line[:45]))
+        if not dates:
+            return None
+
+        posting_date = self._f1_normalize_date(dates[0].group())
+        effective_date = self._f1_normalize_date(dates[1].group()) if len(dates) > 1 else ""
+
+        remainder = line[dates[-1].end():]
+        amounts = list(self.F1_AMOUNT_RE.finditer(remainder))
+
+        if not amounts:
+            narrative_text = remainder.strip()
+            cheque_no, narrative = self._f1_extract_cheque_no(narrative_text)
+            return {
+                "Posting Date": posting_date,
+                "Effective Date": effective_date,
+                "Cheque Sr. No.": cheque_no,
+                "Narrative": narrative,
+                "Debit": "",
+                "Credit": "",
+                "Balance": "",
+            }
+
+        balance = self._f1_normalize_amount(amounts[-1].group())
+        debit = ""
+        credit = ""
+
+        if len(amounts) >= 2:
+            amt_match = amounts[-2]
+            amt_value = self._f1_normalize_amount(amt_match.group())
+            absolute_pos = dates[-1].end() + amt_match.start()
+            if absolute_pos < self.F1_COLUMN_SPLIT:
+                debit = amt_value
+            else:
+                credit = amt_value
+            narrative_text = remainder[:amt_match.start()].strip()
+        else:
+            narrative_text = remainder[:amounts[0].start()].strip()
+
+        cheque_no, narrative = self._f1_extract_cheque_no(narrative_text)
+
+        return {
+            "Posting Date": posting_date,
+            "Effective Date": effective_date,
+            "Cheque Sr. No.": cheque_no,
+            "Narrative": narrative,
+            "Debit": debit,
+            "Credit": credit,
+            "Balance": balance,
+        }
+
+    def _f1_build_rows(self, lines: List[str]) -> List[dict]:
+        rows: List[dict] = []
+
+        for line in lines:
+            if not line.strip():
+                continue
+
+            row = self._f1_parse_line(line)
+
+            if row is None:
+                if rows:
+                    extra = self._collapse_spaces(line)
+                    if extra:
+                        rows[-1]["Narrative"] = self._collapse_spaces(
+                            f"{rows[-1]['Narrative']} {extra}"
+                        )
+                continue
+
+            rows.append(row)
+
+        return rows
+
+    # ==================================================================
+    # FORMAT 2 — clean + convert
+    # ==================================================================
+    def _f2_is_page_break_junk(self, line: str) -> bool:
+        return bool(
+            self.F2_ABOUT_BLANK_RE.match(line)
+            or self.F2_PAGE_BREAK_RE.match(line)
+            or self.F2_PAGE_NUMBER_RE.match(line)
+            or self.F2_TIMESTAMP_RE.match(line)
+            or self.F2_EQUALS_SEPARATOR_RE.match(line)
+            or self.F2_DASH_SEPARATOR_RE.match(line)
+        )
+
+    def _f2_clean_lines(self, raw_text: str):
+        """
+        Page-break noise (about:blank, page numbers, timestamps, and
+        "----"/"====" divider lines) is skipped WITHOUT ending the
+        table, since it appears mid-table at every page break.
+        """
+        kept_lines: List[str] = []
+        inside_table = False
+        table_count = 0
+
+        for raw_line in raw_text.splitlines():
+            line = raw_line.rstrip("\n")
+
+            if not inside_table:
+                if self.FORMAT2_START_RE.search(line):
+                    inside_table = True
+                    table_count += 1
+                continue
+
+            if self.F2_END_MARKER_RE.match(line):
+                inside_table = False
+                continue
+
+            if self._f2_is_page_break_junk(line):
+                continue
+
+            if not line.strip():
+                continue
+
+            kept_lines.append(line)
+
+        return kept_lines, table_count
+
+    def _f2_parse_line(self, line: str):
+        """
+        Parse a single line into a Format-2 row dict, or return None
+        if it doesn't have both a DATE and a VALUE DATE (a
+        description-continuation line).
+        """
+        dates = list(self.F2_DATE_RE.finditer(line[:45]))
+        if len(dates) < 2:
+            return None
+
+        date_val = dates[0].group()
+        value_date = dates[1].group()
+
+        remainder = line[dates[-1].end():]
+
+        r_match = self.F2_R_FLAG_RE.match(remainder)
+        r_flag_end = r_match.end() if r_match else 0
+
+        amounts = list(self.F2_AMOUNT_RE.finditer(remainder))
+
+        if not amounts:
+            description = self._collapse_spaces(remainder[r_flag_end:])
+            return {
+                "DATE": date_val,
+                "VALUE DATE": value_date,
+                "DESCRIPTION": description,
+                "DEBIT": "",
+                "CREDIT": "",
+                "BALANCE": "",
+            }
+
+        balance = amounts[-1].group()
+        debit = ""
+        credit = ""
+
+        if len(amounts) >= 2:
+            amt_match = amounts[-2]
+            amt_value = amt_match.group()
+            absolute_pos = dates[-1].end() + amt_match.start()
+            if absolute_pos < self.F2_COLUMN_SPLIT:
+                debit = amt_value
+            else:
+                credit = amt_value
+            description_text = remainder[r_flag_end:amt_match.start()]
+        else:
+            description_text = remainder[r_flag_end:amounts[0].start()]
+
+        description = self._collapse_spaces(description_text)
+
+        return {
+            "DATE": date_val,
+            "VALUE DATE": value_date,
+            "DESCRIPTION": description,
+            "DEBIT": debit,
+            "CREDIT": credit,
+            "BALANCE": balance,
+        }
+
+    def _f2_build_rows(self, lines: List[str]) -> List[dict]:
+        rows: List[dict] = []
+
+        for raw_line in lines:
+            line = raw_line.rstrip("\n") if raw_line.endswith("\n") else raw_line
+
+            if not line.strip():
+                continue
+
+            row = self._f2_parse_line(line)
+
+            if row is None:
+                if rows:
+                    extra = self._collapse_spaces(line)
+                    if extra:
+                        rows[-1]["DESCRIPTION"] = self._collapse_spaces(
+                            f"{rows[-1]['DESCRIPTION']} {extra}"
+                        )
+                continue
+
+            rows.append(row)
+
+        return rows

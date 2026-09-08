@@ -4,6 +4,10 @@ Unified PDF Parser Dispatcher
 
 Automatically selects the correct parser (BPNG or BSP) based on PDF content.
 Provides a single interface for the GUI or CLI to parse any supported PDF.
+
+Note: BSPParser internally auto-detects which of the two known BSP table
+layouts a given statement uses, so the dispatcher only needs to
+distinguish BPNG vs. BSP at this level.
 """
 
 import pdfplumber
@@ -55,6 +59,7 @@ class PDFParserDispatcher:
             elif parser_type == "BSP":
                 df = self.bsp_parser.parse_pdf(pdf_path, progress_callback=log_callback)
                 all_frames.append(df)
+
             else:
                 if log_callback:
                     log_callback(f"⚠️  WARNING: Could not detect parser for {pdf_path}, skipping")
@@ -71,18 +76,23 @@ class PDFParserDispatcher:
         """
         Detect if the PDF is BPNG or BSP based on text heuristics.
         Returns: "BPNG", "BSP", or "UNKNOWN"
+
+        Checks the first few pages (not just page 1), since a BSP
+        table header doesn't always appear on the cover page.
         """
         try:
             with pdfplumber.open(pdf_path) as pdf:
-                first_page_text = pdf.pages[0].extract_text() or ""
+                pages_to_check = pdf.pages[:3]
+                text = "\n".join((p.extract_text() or "") for p in pages_to_check)
         except Exception:
             return "UNKNOWN"
 
-        first_page_text_upper = first_page_text.upper()
+        text_upper = text.upper()
 
-        if "BANK OF PAPUA NEW GUINEA" in first_page_text_upper:
+        if "BANK OF PAPUA NEW GUINEA" in text_upper:
             return "BPNG"
-        elif "BSP" in first_page_text_upper or "BANK OF SOUTH PACIFIC" in first_page_text_upper:
+
+        if "BSP" in text_upper or "BANK OF SOUTH PACIFIC" in text_upper:
             return "BSP"
-        else:
-            return "UNKNOWN"
+
+        return "UNKNOWN"
