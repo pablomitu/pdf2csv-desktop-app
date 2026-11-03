@@ -25,6 +25,7 @@ class PDFParserDispatcher:
         """Initialize parsers - no Tabula JAR needed!"""
         self.bpng_parser = BPNGParser()
         self.bsp_parser = BSPParser()
+        self._last_detect_note = ""
 
     def parse_pdfs(
         self,
@@ -62,7 +63,10 @@ class PDFParserDispatcher:
 
             else:
                 if log_callback:
-                    log_callback(f"⚠️  WARNING: Could not detect parser for {pdf_path}, skipping")
+                    log_callback(
+                        f"⚠️  WARNING: Could not detect parser for {pdf_path}, "
+                        f"skipping ({self._last_detect_note})"
+                    )
 
         if all_frames:
             combined = pd.concat(all_frames, ignore_index=True)
@@ -80,11 +84,13 @@ class PDFParserDispatcher:
         Checks the first few pages (not just page 1), since a BSP
         table header doesn't always appear on the cover page.
         """
+        self._last_detect_note = ""
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 pages_to_check = pdf.pages[:3]
                 text = "\n".join((p.extract_text() or "") for p in pages_to_check)
-        except Exception:
+        except Exception as e:
+            self._last_detect_note = f"could not open PDF ({type(e).__name__}: {e})"
             return "UNKNOWN"
 
         text_upper = text.upper()
@@ -92,7 +98,17 @@ class PDFParserDispatcher:
         if "BANK OF PAPUA NEW GUINEA" in text_upper:
             return "BPNG"
 
-        if "BSP" in text_upper or "BANK OF SOUTH PACIFIC" in text_upper:
+        # Some BSP statements never print the bank name, so also recognize
+        # them by their table header (either known BSP layout).
+        if (
+            "BSP" in text_upper
+            or "BANK OF SOUTH PACIFIC" in text_upper
+            or self.bsp_parser.can_parse(text)
+        ):
             return "BSP"
 
+        if not text.strip():
+            self._last_detect_note = "no extractable text (scanned/image PDF?)"
+        else:
+            self._last_detect_note = "no known bank name or table header in first 3 pages"
         return "UNKNOWN"

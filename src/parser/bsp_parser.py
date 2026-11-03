@@ -17,7 +17,8 @@ FORMAT 1 — 7 columns (Posting Date / Effective Date / Cheque Sr. No. /
         Posting Date / Effective Date -> Date (DD/MM/YYYY)
         Cheque Sr. No.                -> Integer (or "" if none)
         Narrative                     -> Text
-        Debit / Credit / Balance      -> Decimal (float)
+        Debit / Credit / Balance      -> Decimal (float; a trailing "-"
+                                         in the PDF becomes a negative value)
 
 FORMAT 2 — 6 columns (DATE / VALUE DATE / DESCRIPTION / DEBIT / CREDIT / BALANCE)
     Header:  "   DATE   VALUE DATE   DESCRIPTION   DEBIT   CREDIT   BALANCE "
@@ -79,7 +80,9 @@ class BSPParser(BaseParser):
         "Balance",
     ]
     F1_DATE_RE = re.compile(r"\d{1,2}/\d{2}/\d{4}")
-    F1_AMOUNT_RE = re.compile(r"\d[\d,]*\.\d{2}|\.\d{2}")
+    # Trailing "-" marks a negative amount (e.g. an overdrawn balance such as
+    # "22,804,220.52-"), so it is part of the match.
+    F1_AMOUNT_RE = re.compile(r"(?:\d[\d,]*\.\d{2}|\.\d{2})-?")
     F1_COLUMN_SPLIT = 95  # Debit/Credit boundary, calibrated from sample data
 
     # ------------------------------------------------------------------
@@ -229,8 +232,10 @@ class BSPParser(BaseParser):
 
     @staticmethod
     def _f1_normalize_amount(raw: str) -> float:
-        """Convert '1,690.49' or '.25' into a float."""
-        return float(raw.replace(",", ""))
+        """Convert '1,690.49', '.25' or '22,804.52-' (negative) into a float."""
+        negative = raw.endswith("-")
+        value = float(raw.rstrip("-").replace(",", ""))
+        return -value if negative else value
 
     def _f1_extract_cheque_no(self, text: str):
         """
